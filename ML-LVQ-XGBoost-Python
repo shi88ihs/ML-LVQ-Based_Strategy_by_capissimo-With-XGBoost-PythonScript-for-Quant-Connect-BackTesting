@@ -1,0 +1,123 @@
+##Email: shi88ihs @ protonmail
+##Email me to join my startup company and work together to make trading algos. I have one person on my team so far. I need more bright minds. 
+##Please also give me feedback on this code. 
+
+from AlgorithmImports import *
+from xgboost import XGBClassifier
+import numpy as np
+import pandas as pd
+
+class XGBoostBreakoutAlgorithm(QCAlgorithm):
+    
+    def Initialize(self):
+        self.SetStartDate(2020, 1, 1)
+        self.SetEndDate(2024, 1, 1)
+        self.SetCash(2000)  # You can adjust your capital here
+        
+        self.symbol = self.AddCfd("XAUUSD", Resolution.Hour).Symbol
+        
+        # Rolling window parameters
+        self.lookback = 3
+        self.price_type = "close"
+        
+        # XGBoost parameters
+        self.xgb_model = XGBClassifier(n_estimators=100, max_depth=4, learning_rate=0.1)
+        self.training_period = timedelta(days=60)
+        self.last_train_time = None
+        self.trained = False
+        
+        # Historical data storage
+        self.features = []
+        self.labels = []
+
+        self.SetWarmUpPeriod(self.lookback * 10, Resolution.Hour)
+        self.SetCash(2000)  # Adjust your starting capital here if needed
+        
+    def get_price(self, bar):
+        if self.price_type == "open":
+            return bar.Open
+        elif self.price_type == "high":
+            return bar.High
+        elif self.price_type == "low":
+            return bar.Low
+        elif self.price_type == "close":
+            return bar.Close
+        elif self.price_type == "ohlc4":
+            return (bar.Open + bar.High + bar.Low + bar.Close) / 4
+        else:
+            return bar.Close
+        
+    def OnData(self, data):
+        if self.symbol not in data:
+            return
+        
+        bars = self.History(self.symbol, self.lookback + 1, Resolution.Hour)
+        if len(bars := bars if isinstance(bars, pd.DataFrame) else bars.to_frame()) < self.lookback + 1:
+            return
+        
+        bars.reset_index(drop=True, inplace=True)
+        
+        current_bar = bars.iloc[-1]
+        previous_bars = bars.iloc[:-1]
+        
+        ds = self.get_price(current_bar)
+        highest_high = bars['high'][:-1].max()
+        lowest_low = bars['low'][:-1].min()
+        
+        long_signal = ds > highest_high
+        short_signal = ds < lowest_low
+        
+        # Create training data features
+        features = [
+            bars['close'].iloc[:-1].pct_change().fillna(0).values[-self.lookback:],
+            bars['high'].iloc[:-1].values,
+            bars['low'].iloc[:-1].values,
+        ]
+        features = np.concatenate(features).flatten()
+
+        # Label outcome (1: bullish breakout, -1 bearish breakout, 0: hold)
+        outcome = 0
+        if bars['close'].iloc[-1] > highest_high:
+            outcome = 1
+        elif bars['close'].iloc[-1] < lowest_low:
+            outcome = -1
+
+        # Train model periodically (weekly retrain)
+        if self.Time.weekday() == 0 and (self.last_trained_date is None or self.Time - self.last_trained_date > timedelta(days=7)):
+            if hasattr(self, 'feature_data') and len(self.feature_data) >= 50:
+                X_train = np.array(self.feature_data)
+                y_train = np.array(self.labels)
+                self.xgb_model.fit(X_train, y_train)
+                self.Debug("XGBoost retrained with latest historical data.")
+                self.last_trained_date = self.Time
+
+        # Append new data for training
+        if not hasattr(self, 'feature_data'):
+            self.feature_data = []
+            self.labels = []
+
+        self.feature_data.append(features)
+        self.labels.append(outcome)
+
+        # Predictions
+        if len(self.feature_data) > 30:  # Minimum samples to start predictions
+            prediction = self.xgb_model.predict([features])[0]
+
+            # Trading Logic (XGBoost confirms breakout logic)
+            if prediction == 1 and long_signal:
+                if not self.Portfolio[self.symbol].Invested:
+                    self.SetHoldings(self.symbol, 1)
+                    self.StopMarketOrder(self.symbol, -self.Portfolio[self.symbol].Quantity, lowest_low)
+
+            elif prediction == -1 and short_signal:
+                self.SetHoldings(self.symbol, -1)
+                self.StopMarketOrder(self.symbol, self.Portfolio[self.symbol].Quantity, highest_high)
+        
+        # Exit conditions if signal reverses
+        if self.Portfolio[self.symbol].Invested:
+            holding = self.Portfolio[self.symbol]
+            if holding.IsLong and short_signal:
+                self.Liquidate(self.symbol)
+            elif holding.IsShort and long_signal:
+                self.Liquidate(self.symbol)
+
